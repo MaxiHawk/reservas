@@ -2,9 +2,10 @@
 Reservas Tribunal Endovascular — TMED732 UNAB 2026
 Estética: Universo AngioMasters // Archivo de la Orden (uam.maxihawk.com)
 
-Liberación programada: controlada desde Notion (fila ⚙️ en la base).
-Antes de la apertura se muestra una cuenta regresiva y las reservas quedan
-bloqueadas también del lado del servidor.
+- Bloques genéricos: cada uno puede sellarse como escuadrón de a dos o de
+  forma individual (el estudiante lo elige al inscribirse).
+- Liberación programada controlada desde Notion (fila ⚙️) con cuenta
+  regresiva en vivo; el bloqueo también es real del lado del servidor.
 
 Ejecutar:  streamlit run app.py
 """
@@ -56,7 +57,7 @@ def get_service() -> ReservationService:
     return ReservationService(NotionClient(token, database_id), cache_ttl=ttl, tz_name=tz)
 
 
-# ─────────────────────── Estilo // Archivo de la Orden ────────────────
+# ───────────────────── Estilo // Archivo de la Orden ──────────────────
 
 st.markdown(
     """
@@ -159,13 +160,14 @@ h1, h2, h3 { font-family: 'Rajdhani', sans-serif !important; letter-spacing: .04
 # ─────────────────────── Utilidades ───────────────────────
 
 
-def hora(iso: str | None) -> str:
-    """'2026-06-16T14:06:00.000Z' → '14:06' (hora literal, sin convertir TZ)."""
+def hora(iso) -> str:
+    """'2026-06-16T14:10:00.000Z' → '14:10' (hora literal, sin convertir TZ)."""
     return iso[11:16] if iso and len(iso) >= 16 else "--:--"
 
 
 def es_pausa(b) -> bool:
-    return b.estado == ESTADO_BLOQUEADO and not b.modalidad
+    """Filas no reservables (pausas, apertura, cierre o bloqueadas por docente)."""
+    return b.estado == ESTADO_BLOQUEADO
 
 
 DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
@@ -191,8 +193,11 @@ def dialogo_reserva(block):
         f"**{block.titulo}**  \n"
         f"⏱️ {hora(block.inicio)} – {hora(block.fin)} · martes 16 de junio 2026"
     )
-    if block.es_individual:
-        st.caption("// MODALIDAD: DEFENSA INDIVIDUAL — un solo aspirante //")
+
+    indiv = st.toggle("⭐ Me presento de forma INDIVIDUAL (sin pareja)", key="d_indiv")
+
+    if indiv:
+        st.caption("// MODALIDAD: INDIVIDUAL — un solo aspirante //")
         e1 = st.text_input("🩸 Nombre completo del aspirante", key="d_e1")
         e2 = ""
     else:
@@ -207,7 +212,7 @@ def dialogo_reserva(block):
 
     if st.button("⚔️ SELLAR LA RESERVA", disabled=not confirmo, type="primary"):
         try:
-            resultado = get_service().reserve(block.id, e1, e2)
+            resultado = get_service().reserve(block.id, e1, e2, individual=indiv)
         except ValueError as e:
             st.warning(str(e))
         except ReservationsLockedError as e:
@@ -220,11 +225,13 @@ def dialogo_reserva(block):
         except Exception:
             st.error("Error de conexión con el Archivo. Intenta de nuevo.")
         else:
+            quien = f"**{resultado.estudiante_1}**"
+            if resultado.estudiante_2:
+                quien += f" y **{resultado.estudiante_2}**"
             st.session_state["exito_msg"] = (
-                f"🏆 **{resultado.titulo}** sellado para "
-                f"**{resultado.estudiante_1}**"
-                + (f" y **{resultado.estudiante_2}**" if resultado.estudiante_2 else "")
-                + f" · {hora(resultado.inicio)}–{hora(resultado.fin)}"
+                f"🏆 **{resultado.titulo}** sellado para {quien} "
+                f"({'individual' if indiv else 'escuadrón'}) "
+                f"· {hora(resultado.inicio)}–{hora(resultado.fin)}"
             )
             st.rerun()  # cierra el diálogo y refresca la línea de tiempo
 
@@ -235,15 +242,16 @@ st.markdown(
     """
 <div class="uam-kicker">// UNIVERSO ANGIOMASTERS // ARCHIVO DE LA ORDEN //</div>
 <div class="uam-title">🏛️ Reservas Tribunal Endovascular</div>
-<div class="uam-sub">DEFENSA FINAL ORAL · TMED732 · UNAB 2026 · MARTES 16 JUN · 14:00 → 16:46</div>
+<div class="uam-sub">DEFENSA FINAL ORAL · TMED732 · UNAB 2026 · MARTES 16 JUN · 14:00 → 17:30</div>
 """,
     unsafe_allow_html=True,
 )
 
 st.markdown(
-    "> 🧭 **Aspirantes:** elijan su bloque ante el Tribunal. "
-    "Solo los bloques **DISPONIBLES** pueden sellarse; la decisión es definitiva "
-    "y únicamente el **Sumo Cartógrafo** puede liberarla. Uniforme de TM obligatorio."
+    "> 🧭 **Aspirantes:** todos los bloques son iguales y pueden sellarse como "
+    "**escuadrón de a dos** o de forma **⭐ individual** (lo eliges al "
+    "inscribirte). La decisión es definitiva y únicamente el **Sumo "
+    "Cartógrafo** puede liberarla. Uniforme de TM obligatorio."
 )
 
 if "exito_msg" in st.session_state:
@@ -297,15 +305,15 @@ def timeline():
         st.error("No se pudo consultar el Archivo de la Orden. Reintentando…")
         return
 
-    reservables = [b for b in blocks if b.modalidad]
-    tomados = [b for b in reservables if b.estado == ESTADO_RESERVADO]
-    libres = len(reservables) - len(tomados)
+    defensas = [b for b in blocks if b.estado in (ESTADO_DISPONIBLE, ESTADO_RESERVADO)]
+    tomados = [b for b in defensas if b.estado == ESTADO_RESERVADO]
+    libres = len(defensas) - len(tomados)
 
     c1, c2 = st.columns(2)
     c1.metric("🟢 Bloques libres", libres)
     c2.metric("🔴 Sellados", len(tomados))
-    if reservables:
-        st.progress(len(tomados) / len(reservables))
+    if defensas:
+        st.progress(len(tomados) / len(defensas))
 
     for b in blocks:
         ini, fin = hora(b.inicio), hora(b.fin)
@@ -319,12 +327,6 @@ def timeline():
             )
             continue
 
-        indiv = (
-            ' <span class="uam-badge b-indiv">★ individual</span>'
-            if b.es_individual
-            else ""
-        )
-
         if b.estado == ESTADO_DISPONIBLE:
             if abierto:
                 col_info, col_btn = st.columns([3, 1.2], vertical_alignment="center")
@@ -332,7 +334,7 @@ def timeline():
                     st.markdown(
                         f'<div class="uam-card libre">'
                         f'<span class="uam-time">{ini}–{fin}</span> &nbsp; '
-                        f'<span class="uam-badge b-libre">🟢 disponible</span>{indiv}'
+                        f'<span class="uam-badge b-libre">🟢 disponible</span>'
                         f'<div class="uam-name">{b.titulo}</div></div>',
                         unsafe_allow_html=True,
                     )
@@ -345,15 +347,18 @@ def timeline():
                 st.markdown(
                     f'<div class="uam-card sellado">'
                     f'<span class="uam-time">{ini}–{fin}</span> &nbsp; '
-                    f'<span class="uam-badge b-lock">🔒 portal sellado</span>{indiv}'
+                    f'<span class="uam-badge b-lock">🔒 portal sellado</span>'
                     f'<div class="uam-name">{b.titulo}</div></div>',
                     unsafe_allow_html=True,
                 )
         else:
-            squad = b.estudiante_1 + (f" & {b.estudiante_2}" if b.estudiante_2 else "")
-            squad_html = (
-                f'<div class="uam-squad">⚔️ {squad}</div>' if squad else ""
+            indiv = (
+                ' <span class="uam-badge b-indiv">⭐ individual</span>'
+                if b.es_individual
+                else ""
             )
+            squad = b.estudiante_1 + (f" & {b.estudiante_2}" if b.estudiante_2 else "")
+            squad_html = f'<div class="uam-squad">⚔️ {squad}</div>' if squad else ""
             st.markdown(
                 f'<div class="uam-card tomado">'
                 f'<span class="uam-time">{ini}–{fin}</span> &nbsp; '

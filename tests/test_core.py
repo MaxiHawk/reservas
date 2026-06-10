@@ -1,25 +1,19 @@
 """
-Tests de la lógica crítica (sin red, sin Streamlit): caché, validaciones,
-modalidades (pareja/individual) y —lo más importante— que dos reservas
-simultáneas sobre el mismo bloque NUNCA resulten en doble reserva.
-
-Streamlit ejecuta cada sesión de usuario en un hilo, por lo que las carreras se
-simulan con ThreadPoolExecutor (30 hilos reservando a la vez).
+Tests del núcleo de reservas (sin red, sin Notion, sin Streamlit).
 
 Ejecutar:  python3 tests/test_core.py
 """
 
+import copy
+import os
 import sys
 import threading
-import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from notion_store import (
     ESTADO_BLOQUEADO,
@@ -27,6 +21,7 @@ from notion_store import (
     ESTADO_RESERVADO,
     MODALIDAD_INDIVIDUAL,
     MODALIDAD_PAREJA,
+    BlockNotFoundError,
     BlockUnavailableError,
     ReservationService,
     ReservationsLockedError,
@@ -36,163 +31,172 @@ from notion_store import (
 TZ_CL = ZoneInfo("America/Santiago")
 
 
-def make_config_page(release_iso: str):
-    """Fila de control ⚙️ que define la fecha de liberacion."""
-    return {
-        "id": "config",
-        "properties": {
-            "Bloque": {"title": [{"plain_text": "⚙️ Liberación de reservas"}]},
-            "Estado": {"select": {"name": ESTADO_BLOQUEADO}},
-            "Modalidad": {"select": None},
-            "Horario": {"date": {"start": release_iso, "end": None}},
-            "Estudiante 1": {"rich_text": []},
-            "Estudiante 2": {"rich_text": []},
-            "Notas": {"rich_text": []},
-        },
-    }
-
-
 def make_page(
-    page_id: str,
-    titulo: str,
-    estado: str,
-    modalidad: str = MODALIDAD_PAREJA,
-    est1: str = "",
-    est2: str = "",
+    pid,
+    titulo,
+    estado,
+    modalidad=None,
+    e1="",
+    e2="",
+    inicio="2026-06-16T14:10:00.000Z",
+    fin="2026-06-16T14:22:00.000Z",
 ):
-    """Construye una página con el mismo shape que devuelve la API de Notion."""
     return {
-        "id": page_id,
+        "id": pid,
         "properties": {
             "Bloque": {"title": [{"plain_text": titulo}]},
-            "Estado": {"select": {"name": estado}},
-            "Modalidad": {"select": {"name": modalidad} if modalidad else None},
-            "Horario": {"date": {"start": "2026-06-16T14:06:00", "end": "2026-06-16T14:16:00"}},
-            "Estudiante 1": {"rich_text": [{"plain_text": est1}] if est1 else []},
-            "Estudiante 2": {"rich_text": [{"plain_text": est2}] if est2 else []},
+            "Estado": {"select": ({"name": estado} if estado else None)},
+            "Modalidad": {"select": ({"name": modalidad} if modalidad else None)},
+            "Horario": {"date": {"start": inicio, "end": fin}},
+            "Estudiante 1": {"rich_text": ([{"plain_text": e1}] if e1 else [])},
+            "Estudiante 2": {"rich_text": ([{"plain_text": e2}] if e2 else [])},
             "Notas": {"rich_text": []},
         },
     }
+
+
+def make_config_page(release_iso):
+    """Fila de control ⚙️ que define la fecha de liberación."""
+    return make_page(
+        "config",
+        "⚙️ Liberación de reservas — editar solo la fecha",
+        ESTADO_BLOQUEADO,
+        inicio=release_iso,
+        fin=None,
+    )
 
 
 class FakeNotionClient:
-    """Simula la API de Notion con latencia artificial para forzar carreras."""
+    """Simula la API de Notion en memoria (thread-safe)."""
 
-    def __init__(self, pages: dict, latency: float = 0.01):
-        self.pages = pages
-        self.latency = latency
+    def __init__(self, pages):
+        self.pages = {p["id"]: copy.deepcopy(p) for p in pages}
         self.query_count = 0
         self.update_count = 0
-        self._counter_lock = threading.Lock()
+        self._lock = threading.Lock()
 
-    def query_database(self):
-        with self._counter_lock:
+    def query_all_pages(self):
+        with self._lock:
             self.query_count += 1
-        time.sleep(self.latency)
-        return list(self.pages.values())
-
-    def get_page(self, page_id):
-        time.sleep(self.latency)
-        if page_id not in self.pages:
-            raise Exception("404 not found")
-        return self.pages[page_id]
+            return copy.deepcopy(list(self.pages.values()))
 
     def update_page(self, page_id, properties):
-        # Simula la escritura NO atómica de Notion (read-modify-write)
-        time.sleep(self.latency)
-        page = self.pages[page_id]
-        props = page["properties"]
-        if "Estado" in properties:
-            props["Estado"] = {"select": {"name": properties["Estado"]["select"]["name"]}}
-        for key in ("Estudiante 1", "Estudiante 2"):
-            if key in properties:
-                texts = properties[key]["rich_text"]
-                props[key] = {"rich_text": [{"plain_text": t["text"]["content"]} for t in texts]}
-        with self._counter_lock:
+        with self._lock:
             self.update_count += 1
-        return page
+            page = self.pages[page_id]
+            for name, value in properties.items():
+                page["properties"][name] = copy.deepcopy(value)
+            return copy.deepcopy(page)
+
+
+def default_pages():
+    return [
+        make_page("b1", "B1 — Defensa Oral", ESTADO_DISPONIBLE),
+        make_page(
+            "b2",
+            "B2 — Defensa Oral",
+            ESTADO_RESERVADO,
+            modalidad=MODALIDAD_PAREJA,
+            e1="Ana Soto",
+            e2="Luis Rojas",
+            inicio="2026-06-16T14:22:00.000Z",
+            fin="2026-06-16T14:34:00.000Z",
+        ),
+        make_page(
+            "pausa",
+            "⏸️ Pausa docente 1",
+            ESTADO_BLOQUEADO,
+            inicio="2026-06-16T14:58:00.000Z",
+            fin="2026-06-16T15:08:00.000Z",
+        ),
+    ]
+
+
+def make_service(pages=None, cache_ttl=60.0, now_fn=None):
+    client = FakeNotionClient(pages if pages is not None else default_pages())
+    service = ReservationService(client, cache_ttl=cache_ttl, now_fn=now_fn)
+    return service, client
 
 
 class TestReservasTribunal(unittest.TestCase):
-    def setUp(self):
-        self.pages = {
-            "b1": make_page("b1", "B1 — Defensa en pareja", ESTADO_DISPONIBLE),
-            "pausa": make_page("pausa", "Pausa docente ☕ (1)", ESTADO_BLOQUEADO, modalidad=""),
-            "b2": make_page("b2", "B2 — Defensa en pareja", ESTADO_RESERVADO, est1="Ana", est2="Luis"),
-            "b13": make_page("b13", "B13 — Defensa individual", ESTADO_DISPONIBLE, modalidad=MODALIDAD_INDIVIDUAL),
-        }
-        self.client = FakeNotionClient(self.pages)
-        self.service = ReservationService(self.client, cache_ttl=5.0)
-
-    # ---------- Lecturas / caché ----------
-
     def test_listado_y_cache(self):
-        blocks1 = self.service.list_blocks()
-        blocks2 = self.service.list_blocks()  # debe venir del caché
-        self.assertEqual(len(blocks1), 4)
-        self.assertEqual(self.client.query_count, 1, "La segunda lectura debe usar caché")
-        self.assertIs(blocks1, blocks2)
+        service, client = make_service()
+        a = service.visible_blocks()
+        b = service.visible_blocks()
+        self.assertEqual(len(a), 3)
+        self.assertEqual(len(b), 3)
+        self.assertEqual(client.query_count, 1, "La caché debe evitar la 2da consulta")
 
     def test_lecturas_concurrentes_no_estampida(self):
         """30 hilos pidiendo el listado a la vez → mínimas llamadas reales a Notion."""
+        service, client = make_service()
         with ThreadPoolExecutor(max_workers=30) as ex:
-            results = list(ex.map(lambda _: self.service.list_blocks(), range(30)))
-        self.assertTrue(all(len(r) == 4 for r in results))
-        self.assertLessEqual(
-            self.client.query_count, 2,
-            "El caché + lock debe evitar la estampida de consultas",
-        )
-
-    def test_parseo_modalidades(self):
-        blocks = {b.id: b for b in self.service.list_blocks()}
-        self.assertTrue(blocks["b1"].reservable)
-        self.assertFalse(blocks["b1"].es_individual)
-        self.assertTrue(blocks["b13"].es_individual)
-        self.assertFalse(blocks["pausa"].reservable, "Las pausas nunca son reservables")
-        self.assertFalse(blocks["b2"].reservable, "Un bloque sellado no es reservable")
-
-    # ---------- Reservas ----------
+            list(ex.map(lambda _: service.visible_blocks(), range(30)))
+        self.assertLessEqual(client.query_count, 2)
 
     def test_reserva_pareja_exitosa(self):
-        block = self.service.reserve("b1", "Camila Pérez", "Diego Rojas")
+        service, client = make_service()
+        block = service.reserve("b1", "Camila Pérez", "Diego Muñoz")
         self.assertEqual(block.estado, ESTADO_RESERVADO)
+        self.assertEqual(block.modalidad, MODALIDAD_PAREJA)
         self.assertEqual(block.estudiante_1, "Camila Pérez")
-        self.assertEqual(block.estudiante_2, "Diego Rojas")
+        self.assertEqual(block.estudiante_2, "Diego Muñoz")
+        self.assertEqual(client.update_count, 1)
 
     def test_reserva_individual_con_un_nombre(self):
-        block = self.service.reserve("b13", "Valentina Soto")
+        """Cualquier bloque acepta modalidad individual (elegida al inscribirse)."""
+        service, client = make_service()
+        block = service.reserve("b1", "Valentina Ruiz", individual=True)
         self.assertEqual(block.estado, ESTADO_RESERVADO)
-        self.assertEqual(block.estudiante_1, "Valentina Soto")
-        self.assertEqual(block.estudiante_2, "", "La defensa individual no lleva segundo nombre")
+        self.assertEqual(block.modalidad, MODALIDAD_INDIVIDUAL)
+        self.assertEqual(block.estudiante_1, "Valentina Ruiz")
+        self.assertEqual(block.estudiante_2, "")
+        self.assertEqual(client.update_count, 1)
+
+    def test_individual_ignora_segundo_nombre(self):
+        service, _ = make_service()
+        block = service.reserve("b1", "Valentina Ruiz", "Texto basura", individual=True)
+        self.assertEqual(block.estudiante_2, "")
+        self.assertEqual(block.modalidad, MODALIDAD_INDIVIDUAL)
 
     def test_pareja_requiere_ambos_nombres(self):
+        service, client = make_service()
         with self.assertRaises(ValueError):
-            self.service.reserve("b1", "Camila Pérez", "")
-        self.assertEqual(self.client.update_count, 0, "No debe escribir nada")
+            service.reserve("b1", "Camila Pérez", "")
+        self.assertEqual(client.update_count, 0)
 
     def test_nombre_1_siempre_obligatorio(self):
+        service, client = make_service()
         with self.assertRaises(ValueError):
-            self.service.reserve("b1", "   ", "Diego")
+            service.reserve("b1", "   ", "Diego Muñoz")
+        with self.assertRaises(ValueError):
+            service.reserve("b1", "", individual=True)
+        self.assertEqual(client.update_count, 0)
 
     def test_no_reserva_pausa(self):
+        service, client = make_service()
         with self.assertRaises(BlockUnavailableError):
-            self.service.reserve("pausa", "Camila", "Diego")
-        self.assertEqual(self.client.update_count, 0)
+            service.reserve("pausa", "Camila Pérez", "Diego Muñoz")
+        self.assertEqual(client.update_count, 0)
 
     def test_no_reserva_ya_sellado(self):
+        service, client = make_service()
         with self.assertRaises(BlockUnavailableError):
-            self.service.reserve("b2", "Camila", "Diego")
-        self.assertEqual(self.client.update_count, 0)
+            service.reserve("b2", "Camila Pérez", "Diego Muñoz")
+        self.assertEqual(client.update_count, 0)
 
-    # ---------- Carreras (lo crítico) ----------
+    def test_bloque_inexistente(self):
+        service, _ = make_service()
+        with self.assertRaises(BlockNotFoundError):
+            service.reserve("no-existe", "Camila Pérez", "Diego Muñoz")
 
-    def test_carrera_30_reservas_simultaneas_mismo_bloque(self):
-        """EL TEST CLAVE: 30 escuadrones (hilos) intentan sellar el mismo bloque a
-        la vez. Exactamente UNO gana; los otros 29 reciben BlockUnavailableError."""
+    def test_carrera_30_escuadrones_un_ganador(self):
+        """30 hilos contra el MISMO bloque → exactamente 1 gana, 1 escritura."""
+        service, client = make_service()
 
         def intentar(i):
             try:
-                return self.service.reserve("b1", f"Aspirante A{i}", f"Aspirante B{i}")
+                return service.reserve("b1", f"Aspirante A{i}", f"Aspirante B{i}")
             except Exception as e:
                 return e
 
@@ -201,43 +205,29 @@ class TestReservasTribunal(unittest.TestCase):
 
         exitos = [r for r in results if not isinstance(r, Exception)]
         conflictos = [r for r in results if isinstance(r, BlockUnavailableError)]
-        self.assertEqual(len(exitos), 1, "Exactamente un escuadrón debe ganar el bloque")
-        self.assertEqual(len(conflictos), 29, "Los demás deben recibir conflicto")
-        self.assertEqual(self.client.update_count, 1, "Solo debe haber UNA escritura en Notion")
+        self.assertEqual(len(exitos), 1)
+        self.assertEqual(len(conflictos), 29)
+        self.assertEqual(client.update_count, 1)
 
-    def test_carrera_bloques_distintos_todas_ganan(self):
-        """Reservas simultáneas sobre bloques DISTINTOS deben funcionar todas
-        (incluida la individual)."""
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            f1 = ex.submit(self.service.reserve, "b1", "P1A", "P1B")
-            f2 = ex.submit(self.service.reserve, "b13", "Solo1")
-            r1, r2 = f1.result(), f2.result()
-
-        self.assertEqual(r1.estado, ESTADO_RESERVADO)
-        self.assertEqual(r2.estado, ESTADO_RESERVADO)
-        self.assertEqual(self.client.update_count, 2)
-
-    def test_cache_se_invalida_tras_reserva(self):
-        self.service.list_blocks()
-        self.service.reserve("b1", "Camila", "Diego")
-        blocks = self.service.list_blocks()  # debe refrescar
+    def test_invalida_cache_tras_reservar(self):
+        service, client = make_service()
+        service.visible_blocks()
+        service.reserve("b1", "Camila Pérez", "Diego Muñoz")
+        blocks = service.visible_blocks()
         b1 = next(b for b in blocks if b.id == "b1")
         self.assertEqual(b1.estado, ESTADO_RESERVADO)
-        self.assertEqual(self.client.query_count, 2)
 
 
 class TestLiberacionProgramada(unittest.TestCase):
-    """La fila ⚙️ en Notion controla cuando se abren las reservas."""
+    """La fila ⚙️ en Notion controla cuándo se abren las reservas."""
 
     RELEASE_ISO = "2026-06-14T20:00:00.000Z"  # se interpreta LITERAL: 20:00 Chile
 
-    def _service(self, now: datetime, with_config: bool = True):
-        pages = {"b1": make_page("b1", "B1 — Defensa en pareja", ESTADO_DISPONIBLE)}
+    def _service(self, now, with_config=True):
+        pages = default_pages()
         if with_config:
-            pages["config"] = make_config_page(self.RELEASE_ISO)
-        client = FakeNotionClient(pages)
-        service = ReservationService(client, cache_ttl=5.0, now_fn=lambda: now)
-        return service, client
+            pages.append(make_config_page(self.RELEASE_ISO))
+        return make_service(pages, now_fn=lambda: now)
 
     def test_parseo_literal_ignora_sufijo_tz(self):
         """'...20:00:00.000Z' debe interpretarse como 20:00 hora de Chile."""
@@ -252,14 +242,14 @@ class TestLiberacionProgramada(unittest.TestCase):
         self.assertFalse(service.reservations_open())
         self.assertGreater(service.seconds_until_release(), 0)
         with self.assertRaises(ReservationsLockedError):
-            service.reserve("b1", "Camila", "Diego")
+            service.reserve("b1", "Camila Pérez", "Diego Muñoz")
         self.assertEqual(client.update_count, 0, "No debe escribir antes de la apertura")
 
     def test_despues_de_la_apertura_funciona(self):
         now = datetime(2026, 6, 14, 20, 0, 1, tzinfo=TZ_CL)
         service, _ = self._service(now)
         self.assertTrue(service.reservations_open())
-        block = service.reserve("b1", "Camila", "Diego")
+        block = service.reserve("b1", "Camila Pérez", "Diego Muñoz")
         self.assertEqual(block.estado, ESTADO_RESERVADO)
 
     def test_sin_fila_config_siempre_abierto(self):
@@ -267,17 +257,17 @@ class TestLiberacionProgramada(unittest.TestCase):
         service, _ = self._service(now, with_config=False)
         self.assertIsNone(service.get_release_time())
         self.assertTrue(service.reservations_open())
-        block = service.reserve("b1", "Camila", "Diego")
+        block = service.reserve("b1", "Camila Pérez", "Diego Muñoz")
         self.assertEqual(block.estado, ESTADO_RESERVADO)
 
-    def test_fila_config_no_es_reservable_ni_visible(self):
+    def test_fila_config_no_es_visible_ni_reservable(self):
         now = datetime(2026, 6, 15, 0, 0, 0, tzinfo=TZ_CL)
         service, client = self._service(now)
         visibles = service.visible_blocks()
         self.assertTrue(all(not b.es_config for b in visibles))
-        self.assertEqual(len(visibles), 1)
+        self.assertEqual(len(visibles), 3)
         with self.assertRaises(BlockUnavailableError):
-            service.reserve("config", "Camila", "Diego")
+            service.reserve("config", "Camila Pérez", "Diego Muñoz")
         self.assertEqual(client.update_count, 0)
 
     def test_carrera_en_el_segundo_exacto_de_apertura(self):

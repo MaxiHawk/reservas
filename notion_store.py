@@ -1,39 +1,42 @@
 """
-Capa de datos: cliente de la API de Notion + servicio de reservas (versión sync
-para Streamlit).
+Capa de datos: cliente de la API de Notion + lógica de reservas thread-safe.
 
-Diseño anti-condición-de-carrera:
-- Streamlit ejecuta cada sesión de usuario en un HILO dentro de UN proceso.
-- Todas las escrituras pasan por un threading.Lock global (cola única).
-- Antes de escribir se re-verifica el estado real del bloque en Notion.
-- Las lecturas usan un caché en memoria con TTL para no saturar la API de
-  Notion (~3 req/s) aunque 30+ estudiantes consulten a la vez.
+Streamlit atiende cada sesión en un hilo dentro de UN solo proceso, por lo que
+un threading.Lock global (compartido vía @st.cache_resource en app.py) basta
+para serializar las escrituras y garantizar que un bloque no se reserve dos veces.
 
-IMPORTANTE: el servicio debe instanciarse UNA sola vez para todo el proceso
-(en Streamlit: con @st.cache_resource), para que el lock sea compartido.
+Soporta dos modalidades de bloque (propiedad "Modalidad" en Notion):
+  - Pareja: requiere 2 nombres.
+  - Individual: requiere 1 nombre (defensa individual, curso impar).
 """
 
 from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Optional
 
 NOTION_VERSION = "2022-06-28"
+NOTION_BASE = "https://api.notion.com/v1"
 
-# Nombres de propiedades en la base de datos de Notion
+# Nombres EXACTOS de las propiedades en la base de Notion
 PROP_TITULO = "Bloque"
 PROP_HORARIO = "Horario"
 PROP_ESTADO = "Estado"
 PROP_EST1 = "Estudiante 1"
 PROP_EST2 = "Estudiante 2"
 PROP_FECHA_RESERVA = "Fecha de reserva"
+PROP_MODALIDAD = "Modalidad"
+PROP_NOTAS = "Notas"
 
 ESTADO_DISPONIBLE = "Disponible"
 ESTADO_RESERVADO = "Reservado"
 ESTADO_BLOQUEADO = "Bloqueado"
+
+MODALIDAD_PAREJA = "Pareja"
+MODALIDAD_INDIVIDUAL = "Individual"
 
 
 class BlockNotFoundError(Exception):
@@ -43,170 +46,181 @@ class BlockNotFoundError(Exception):
 class BlockUnavailableError(Exception):
     """El bloque ya no está disponible (reservado o bloqueado)."""
 
-    def __init__(self, estado: str):
-        self.estado = estado
-        super().__init__(f"Bloque no disponible (estado actual: {estado})")
-
 
 @dataclass
 class Block:
     id: str
     titulo: str
     estado: str
-    inicio: Optional[str] = None
-    fin: Optional[str] = None
-    estudiante_1: str = ""
-    estudiante_2: str = ""
+    inicio: Optional[str]
+    fin: Optional[str]
+    estudiante_1: str
+    estudiante_2: str
+    modalidad: str  # "Pareja", "Individual" o "" (no reservable)
+    notas: str = ""
 
     @property
-    def disponible(self) -> bool:
-        return self.estado == ESTADO_DISPONIBLE
+    def reservable(self) -> bool:
+        return self.estado == ESTADO_DISPONIBLE and self.modalidad in (
+            MODALIDAD_PAREJA,
+            MODALIDAD_INDIVIDUAL,
+        )
 
     @property
-    def reservado_por(self) -> Optional[str]:
-        if self.estado != ESTADO_RESERVADO:
-            return None
-        return f"{self.estudiante_1} / {self.estudiante_2}".strip(" /")
+    def es_individual(self) -> bool:
+        return self.modalidad == MODALIDAD_INDIVIDUAL
 
 
-def _parse_block(page: dict[str, Any]) -> Block:
-    """Convierte una página de la API de Notion en un Block."""
+def _plain_text(rich: list) -> str:
+    return "".join(part.get("plain_text", "") for part in rich or [])
+
+
+def _parse_block(page: dict) -> Block:
     props = page.get("properties", {})
 
-    def plain_text(items: list[dict]) -> str:
-        return "".join(i.get("plain_text", "") for i in items)
+    titulo = _plain_text(props.get(PROP_TITULO, {}).get("title", []))
 
-    titulo = plain_text(props.get(PROP_TITULO, {}).get("title", []) or [])
-    estado_obj = props.get(PROP_ESTADO, {}).get("select") or {}
-    estado = estado_obj.get("name", ESTADO_BLOQUEADO)
-    fecha = props.get(PROP_HORARIO, {}).get("date") or {}
-    est1 = plain_text(props.get(PROP_EST1, {}).get("rich_text", []) or [])
-    est2 = plain_text(props.get(PROP_EST2, {}).get("rich_text", []) or [])
+    estado_sel = props.get(PROP_ESTADO, {}).get("select") or {}
+    estado = estado_sel.get("name", "")
+
+    modalidad_sel = props.get(PROP_MODALIDAD, {}).get("select") or {}
+    modalidad = modalidad_sel.get("name", "")
+
+    horario = props.get(PROP_HORARIO, {}).get("date") or {}
 
     return Block(
         id=page["id"],
         titulo=titulo,
         estado=estado,
-        inicio=fecha.get("start"),
-        fin=fecha.get("end"),
-        estudiante_1=est1,
-        estudiante_2=est2,
+        inicio=horario.get("start"),
+        fin=horario.get("end"),
+        estudiante_1=_plain_text(props.get(PROP_EST1, {}).get("rich_text", [])),
+        estudiante_2=_plain_text(props.get(PROP_EST2, {}).get("rich_text", [])),
+        modalidad=modalidad,
+        notas=_plain_text(props.get(PROP_NOTAS, {}).get("rich_text", [])),
     )
 
 
 class NotionClient:
-    """Cliente HTTP real (síncrono) contra la API pública de Notion."""
+    """Cliente síncrono mínimo de la API de Notion (usa httpx)."""
 
-    def __init__(self, token: str, database_id: str):
-        import httpx  # import local: los tests no requieren httpx
+    def __init__(self, token: str, database_id: str, timeout: float = 15.0):
+        import httpx  # import local: los tests usan un cliente falso
 
-        self._database_id = database_id
+        self.database_id = database_id
         self._http = httpx.Client(
-            base_url="https://api.notion.com",
+            base_url=NOTION_BASE,
             headers={
                 "Authorization": f"Bearer {token}",
                 "Notion-Version": NOTION_VERSION,
                 "Content-Type": "application/json",
             },
-            timeout=30.0,
+            timeout=timeout,
         )
 
-    def query_database(self) -> list[dict[str, Any]]:
-        results: list[dict[str, Any]] = []
-        payload: dict[str, Any] = {"page_size": 100}
+    def query_database(self) -> list[dict]:
+        """Devuelve todas las páginas de la base, ordenadas por Horario."""
+        results: list[dict] = []
+        payload: dict = {
+            "sorts": [{"property": PROP_HORARIO, "direction": "ascending"}],
+            "page_size": 100,
+        }
         while True:
-            r = self._http.post(
-                f"/v1/databases/{self._database_id}/query", json=payload
-            )
-            r.raise_for_status()
-            data = r.json()
+            resp = self._http.post(f"/databases/{self.database_id}/query", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
             results.extend(data.get("results", []))
             if not data.get("has_more"):
-                break
+                return results
             payload["start_cursor"] = data["next_cursor"]
-        return results
 
-    def get_page(self, page_id: str) -> dict[str, Any]:
-        r = self._http.get(f"/v1/pages/{page_id}")
-        r.raise_for_status()
-        return r.json()
+    def get_page(self, page_id: str) -> dict:
+        resp = self._http.get(f"/pages/{page_id}")
+        resp.raise_for_status()
+        return resp.json()
 
-    def update_page(self, page_id: str, properties: dict[str, Any]) -> dict[str, Any]:
-        r = self._http.patch(f"/v1/pages/{page_id}", json={"properties": properties})
-        r.raise_for_status()
-        return r.json()
-
-
-@dataclass
-class _Cache:
-    blocks: list[Block] = field(default_factory=list)
-    fetched_at: float = 0.0
+    def update_page(self, page_id: str, properties: dict) -> dict:
+        resp = self._http.patch(f"/pages/{page_id}", json={"properties": properties})
+        resp.raise_for_status()
+        return resp.json()
 
 
 class ReservationService:
-    """Lógica de negocio: listado con caché + reserva serializada (thread-safe)."""
+    """Lógica de reservas con caché de lecturas y lock global de escrituras."""
 
     def __init__(self, client, cache_ttl: float = 5.0):
-        self._client = client
-        self._cache_ttl = cache_ttl
-        self._cache = _Cache()
-        self._cache_lock = threading.Lock()    # evita estampida de refrescos
-        self._reserve_lock = threading.Lock()  # serializa TODAS las escrituras
+        self.client = client
+        self.cache_ttl = cache_ttl
+        self._write_lock = threading.Lock()
+        self._cache_lock = threading.Lock()
+        self._cache: Optional[list[Block]] = None
+        self._cache_time: float = 0.0
 
-    # ---------- Lectura ----------
+    # ---------- Lecturas ----------
 
     def list_blocks(self, force_refresh: bool = False) -> list[Block]:
-        now = time.monotonic()
-        if not force_refresh and (now - self._cache.fetched_at) < self._cache_ttl:
-            return self._cache.blocks
         with self._cache_lock:
-            # double-check: otro hilo pudo haber refrescado mientras esperábamos
-            now = time.monotonic()
-            if not force_refresh and (now - self._cache.fetched_at) < self._cache_ttl:
-                return self._cache.blocks
-            pages = self._client.query_database()
+            fresh = (
+                self._cache is not None
+                and (time.monotonic() - self._cache_time) < self.cache_ttl
+            )
+            if fresh and not force_refresh:
+                return self._cache
+            pages = self.client.query_database()
             blocks = [_parse_block(p) for p in pages]
-            blocks.sort(key=lambda b: (b.inicio or "", b.titulo))
-            self._cache = _Cache(blocks=blocks, fetched_at=time.monotonic())
-            return self._cache.blocks
+            blocks.sort(key=lambda b: b.inicio or "")
+            self._cache = blocks
+            self._cache_time = time.monotonic()
+            return blocks
 
-    # ---------- Escritura ----------
+    def _invalidate_cache(self) -> None:
+        with self._cache_lock:
+            self._cache = None
+            self._cache_time = 0.0
 
-    def reserve(self, block_id: str, estudiante_1: str, estudiante_2: str) -> Block:
-        """Reserva un bloque. Lanza BlockUnavailableError si ya no está disponible.
+    # ---------- Escrituras ----------
 
-        Toda la operación (verificar + escribir) ocurre dentro de un lock global:
-        dos reservas simultáneas sobre el mismo bloque se procesan en serie.
-        La primera gana; la segunda recibe el error.
+    def reserve(self, block_id: str, estudiante_1: str, estudiante_2: str = "") -> Block:
+        """Reserva un bloque. Lanza:
+        - ValueError si faltan nombres según la modalidad.
+        - BlockNotFoundError si el bloque no existe.
+        - BlockUnavailableError si ya no está disponible (carrera perdida).
         """
-        estudiante_1 = estudiante_1.strip()
-        estudiante_2 = estudiante_2.strip()
-        if not estudiante_1 or not estudiante_2:
-            raise ValueError("Se requieren los nombres de ambos integrantes.")
+        e1 = (estudiante_1 or "").strip()
+        e2 = (estudiante_2 or "").strip()
+        if not e1:
+            raise ValueError("Debes ingresar al menos el primer nombre.")
 
-        with self._reserve_lock:
-            # 1) Releer el estado REAL desde Notion (no desde el caché)
+        with self._write_lock:  # serializa TODAS las escrituras
             try:
-                page = self._client.get_page(block_id)
-            except Exception as exc:  # 404 u otros
-                raise BlockNotFoundError(str(exc)) from exc
+                page = self.client.get_page(block_id)
+            except Exception as exc:
+                raise BlockNotFoundError(f"Bloque no encontrado: {block_id}") from exc
 
             block = _parse_block(page)
-            if not block.disponible:
-                raise BlockUnavailableError(block.estado)
 
-            # 2) Escribir la reserva
+            # Doble verificación contra Notion justo antes de escribir
+            if block.estado != ESTADO_DISPONIBLE:
+                raise BlockUnavailableError(
+                    f"El bloque '{block.titulo}' ya no está disponible "
+                    f"(estado actual: {block.estado})."
+                )
+            if not block.modalidad:
+                raise BlockUnavailableError(
+                    f"El bloque '{block.titulo}' no es reservable."
+                )
+            if block.modalidad == MODALIDAD_PAREJA and not e2:
+                raise ValueError("Este bloque es en pareja: ingresa ambos nombres.")
+            if block.modalidad == MODALIDAD_INDIVIDUAL:
+                e2 = ""  # defensa individual: solo un nombre
+
             now_iso = datetime.now(timezone.utc).isoformat()
-            updated = self._client.update_page(
-                block_id,
-                {
-                    PROP_ESTADO: {"select": {"name": ESTADO_RESERVADO}},
-                    PROP_EST1: {"rich_text": [{"text": {"content": estudiante_1}}]},
-                    PROP_EST2: {"rich_text": [{"text": {"content": estudiante_2}}]},
-                    PROP_FECHA_RESERVA: {"date": {"start": now_iso}},
-                },
-            )
-
-            # 3) Invalidar caché para que el resto vea el cambio de inmediato
-            self._cache.fetched_at = 0.0
+            properties = {
+                PROP_ESTADO: {"select": {"name": ESTADO_RESERVADO}},
+                PROP_EST1: {"rich_text": [{"text": {"content": e1}}]},
+                PROP_EST2: {"rich_text": ([{"text": {"content": e2}}] if e2 else [])},
+                PROP_FECHA_RESERVA: {"date": {"start": now_iso}},
+            }
+            updated = self.client.update_page(block_id, properties)
+            self._invalidate_cache()
             return _parse_block(updated)

@@ -2,6 +2,10 @@
 Reservas Tribunal Endovascular — TMED732 UNAB 2026
 Estética: Universo AngioMasters // Archivo de la Orden (uam.maxihawk.com)
 
+Liberación programada: controlada desde Notion (fila ⚙️ en la base).
+Antes de la apertura se muestra una cuenta regresiva y las reservas quedan
+bloqueadas también del lado del servidor.
+
 Ejecutar:  streamlit run app.py
 """
 
@@ -16,6 +20,7 @@ from notion_store import (
     BlockUnavailableError,
     NotionClient,
     ReservationService,
+    ReservationsLockedError,
 )
 
 # ─────────────────────── Configuración ───────────────────────
@@ -47,7 +52,8 @@ def get_service() -> ReservationService:
         st.error("⚠️ Falta configurar NOTION_TOKEN y NOTION_DATABASE_ID en Secrets.")
         st.stop()
     ttl = float(_secret("CACHE_TTL_SECONDS", "5"))
-    return ReservationService(NotionClient(token, database_id), cache_ttl=ttl)
+    tz = _secret("RESERVAS_TZ", "America/Santiago")
+    return ReservationService(NotionClient(token, database_id), cache_ttl=ttl, tz_name=tz)
 
 
 # ─────────────────────── Estilo // Archivo de la Orden ────────────────
@@ -91,6 +97,7 @@ h1, h2, h3 { font-family: 'Rajdhani', sans-serif !important; letter-spacing: .04
 .uam-card.libre   { --edge: #00e5ff; }
 .uam-card.tomado  { --edge: #ff5d73; opacity: .92; }
 .uam-card.pausa   { --edge: #44506a; opacity: .75; padding: .45rem 1rem; }
+.uam-card.sellado { --edge: #ffd166; }
 .uam-time {
   font-family: 'Share Tech Mono', monospace;
   font-size: 1.05rem; color: #00e5ff; white-space: nowrap;
@@ -107,7 +114,33 @@ h1, h2, h3 { font-family: 'Rajdhani', sans-serif !important; letter-spacing: .04
 .b-tomado { color: #ff5d73; border-color: rgba(255,93,115,.5); background: rgba(255,93,115,.08); }
 .b-pausa  { color: #8fa8c7; border-color: rgba(143,168,199,.4); background: rgba(143,168,199,.07); }
 .b-indiv  { color: #ffd166; border-color: rgba(255,209,102,.5); background: rgba(255,209,102,.08); }
+.b-lock   { color: #ffd166; border-color: rgba(255,209,102,.5); background: rgba(255,209,102,.08); }
 .uam-squad { font-family: 'Share Tech Mono', monospace; font-size: .82rem; color: #ffd166; margin-top: .15rem; }
+
+/* Cuenta regresiva — portal sellado */
+.uam-portal {
+  border: 1px solid rgba(255,209,102,.4);
+  border-radius: 16px; text-align: center;
+  background: linear-gradient(160deg, rgba(30,24,8,.6), rgba(9,14,26,.95));
+  box-shadow: 0 0 30px rgba(255,209,102,.12), inset 0 0 40px rgba(255,209,102,.04);
+  padding: 1.4rem 1rem; margin: 1rem 0;
+}
+.uam-portal .lbl {
+  font-family: 'Share Tech Mono', monospace; color: #ffd166;
+  letter-spacing: .3em; font-size: .75rem; text-transform: uppercase;
+}
+.uam-portal .timer {
+  font-family: 'Share Tech Mono', monospace; font-weight: 400;
+  font-size: clamp(2rem, 9vw, 3.4rem); color: #ffd166;
+  text-shadow: 0 0 24px rgba(255,209,102,.55); margin: .3rem 0;
+}
+.uam-portal .units {
+  font-family: 'Share Tech Mono', monospace; color: #8fa8c7;
+  font-size: .7rem; letter-spacing: .35em; text-transform: uppercase;
+}
+.uam-portal .fecha {
+  font-family: 'Rajdhani', sans-serif; color: #e6f1ff; font-size: 1rem; margin-top: .5rem;
+}
 
 .stButton > button {
   font-family: 'Share Tech Mono', monospace !important;
@@ -133,6 +166,20 @@ def hora(iso: str | None) -> str:
 
 def es_pausa(b) -> bool:
     return b.estado == ESTADO_BLOQUEADO and not b.modalidad
+
+
+DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+MESES = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+]
+
+
+def fecha_es(dt) -> str:
+    return (
+        f"{DIAS[dt.weekday()]} {dt.day} de {MESES[dt.month - 1]} "
+        f"· {dt.strftime('%H:%M')} hrs (hora Chile)"
+    )
 
 
 # ─────────────────────── Diálogo de reserva (2 pasos) ───────────────
@@ -163,6 +210,8 @@ def dialogo_reserva(block):
             resultado = get_service().reserve(block.id, e1, e2)
         except ValueError as e:
             st.warning(str(e))
+        except ReservationsLockedError as e:
+            st.error(f"🔒 El portal aún está sellado. {e}")
         except BlockUnavailableError:
             st.error(
                 "⚡ Otro escuadrón selló este bloque hace instantes. "
@@ -200,13 +249,50 @@ st.markdown(
 if "exito_msg" in st.session_state:
     st.success(st.session_state.pop("exito_msg"))
 
+# ─────────────────────── Cuenta regresiva (portal sellado) ────────────
+
+
+@st.fragment(run_every=1)
+def portal_countdown():
+    """Cronómetro en vivo hasta la apertura. Al llegar a cero, recarga la app."""
+    svc = get_service()
+    try:
+        release = svc.get_release_time()
+        restante = svc.seconds_until_release()
+    except Exception:
+        return
+    if release is None or restante <= 0:
+        st.rerun(scope="app")  # ¡portal abierto! → recargar todo
+        return
+
+    total = int(restante)
+    d, resto = divmod(total, 86400)
+    h, resto = divmod(resto, 3600)
+    m, s = divmod(resto, 60)
+    timer = f"{d:02d} : {h:02d} : {m:02d} : {s:02d}"
+
+    st.markdown(
+        f"""
+<div class="uam-portal">
+  <div class="lbl">// PORTAL SELLADO // APERTURA DE RESERVAS EN //</div>
+  <div class="timer">{timer}</div>
+  <div class="units">días&nbsp;&nbsp;&nbsp;horas&nbsp;&nbsp;&nbsp;min&nbsp;&nbsp;&nbsp;seg</div>
+  <div class="fecha">🗝️ El Sumo Cartógrafo abrirá el portal el <b>{fecha_es(release)}</b></div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
 # ─────────────────────── Línea de tiempo (auto-refresh 5 s) ────────────
 
 
 @st.fragment(run_every=5)
 def timeline():
+    svc = get_service()
     try:
-        blocks = get_service().list_blocks()
+        blocks = svc.visible_blocks()
+        abierto = svc.reservations_open()
     except Exception:
         st.error("No se pudo consultar el Archivo de la Orden. Reintentando…")
         return
@@ -240,19 +326,29 @@ def timeline():
         )
 
         if b.estado == ESTADO_DISPONIBLE:
-            col_info, col_btn = st.columns([3, 1.2], vertical_alignment="center")
-            with col_info:
+            if abierto:
+                col_info, col_btn = st.columns([3, 1.2], vertical_alignment="center")
+                with col_info:
+                    st.markdown(
+                        f'<div class="uam-card libre">'
+                        f'<span class="uam-time">{ini}–{fin}</span> &nbsp; '
+                        f'<span class="uam-badge b-libre">🟢 disponible</span>{indiv}'
+                        f'<div class="uam-name">{b.titulo}</div></div>',
+                        unsafe_allow_html=True,
+                    )
+                with col_btn:
+                    if st.button("Reservar", key=f"btn_{b.id}"):
+                        st.session_state["bloque_elegido"] = b.id
+                        st.rerun(scope="app")
+            else:
+                # Cronograma visible pero bloqueado hasta la apertura
                 st.markdown(
-                    f'<div class="uam-card libre">'
+                    f'<div class="uam-card sellado">'
                     f'<span class="uam-time">{ini}–{fin}</span> &nbsp; '
-                    f'<span class="uam-badge b-libre">🟢 disponible</span>{indiv}'
+                    f'<span class="uam-badge b-lock">🔒 portal sellado</span>{indiv}'
                     f'<div class="uam-name">{b.titulo}</div></div>',
                     unsafe_allow_html=True,
                 )
-            with col_btn:
-                if st.button("Reservar", key=f"btn_{b.id}"):
-                    st.session_state["bloque_elegido"] = b.id
-                    st.rerun(scope="app")
         else:
             squad = b.estudiante_1 + (f" & {b.estudiante_2}" if b.estudiante_2 else "")
             squad_html = (
@@ -272,12 +368,25 @@ def timeline():
     )
 
 
+# ─────────────────────── Render principal ─────────────────────
+
+_portal_abierto = True
+try:
+    _portal_abierto = get_service().reservations_open()
+except Exception:
+    pass
+
+if not _portal_abierto:
+    portal_countdown()
+
 timeline()
 
 # Abrir el diálogo fuera del fragmento (rerun completo de la app)
 _elegido = st.session_state.pop("bloque_elegido", None)
 if _elegido:
-    _b = next((x for x in get_service().list_blocks() if x.id == _elegido), None)
+    _b = next(
+        (x for x in get_service().visible_blocks() if x.id == _elegido), None
+    )
     if _b is not None and _b.reservable:
         dialogo_reserva(_b)
     else:

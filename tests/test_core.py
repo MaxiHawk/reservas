@@ -18,6 +18,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from notion_store import (
     ESTADO_BLOQUEADO,
     ESTADO_DISPONIBLE,
@@ -26,7 +29,27 @@ from notion_store import (
     MODALIDAD_PAREJA,
     BlockUnavailableError,
     ReservationService,
+    ReservationsLockedError,
+    parse_local_dt,
 )
+
+TZ_CL = ZoneInfo("America/Santiago")
+
+
+def make_config_page(release_iso: str):
+    """Fila de control ⚙️ que define la fecha de liberacion."""
+    return {
+        "id": "config",
+        "properties": {
+            "Bloque": {"title": [{"plain_text": "⚙️ Liberación de reservas"}]},
+            "Estado": {"select": {"name": ESTADO_BLOQUEADO}},
+            "Modalidad": {"select": None},
+            "Horario": {"date": {"start": release_iso, "end": None}},
+            "Estudiante 1": {"rich_text": []},
+            "Estudiante 2": {"rich_text": []},
+            "Notas": {"rich_text": []},
+        },
+    }
 
 
 def make_page(
@@ -201,6 +224,79 @@ class TestReservasTribunal(unittest.TestCase):
         b1 = next(b for b in blocks if b.id == "b1")
         self.assertEqual(b1.estado, ESTADO_RESERVADO)
         self.assertEqual(self.client.query_count, 2)
+
+
+class TestLiberacionProgramada(unittest.TestCase):
+    """La fila ⚙️ en Notion controla cuando se abren las reservas."""
+
+    RELEASE_ISO = "2026-06-14T20:00:00.000Z"  # se interpreta LITERAL: 20:00 Chile
+
+    def _service(self, now: datetime, with_config: bool = True):
+        pages = {"b1": make_page("b1", "B1 — Defensa en pareja", ESTADO_DISPONIBLE)}
+        if with_config:
+            pages["config"] = make_config_page(self.RELEASE_ISO)
+        client = FakeNotionClient(pages)
+        service = ReservationService(client, cache_ttl=5.0, now_fn=lambda: now)
+        return service, client
+
+    def test_parseo_literal_ignora_sufijo_tz(self):
+        """'...20:00:00.000Z' debe interpretarse como 20:00 hora de Chile."""
+        dt = parse_local_dt(self.RELEASE_ISO)
+        self.assertEqual((dt.year, dt.month, dt.day), (2026, 6, 14))
+        self.assertEqual((dt.hour, dt.minute), (20, 0))
+        self.assertEqual(str(dt.tzinfo), "America/Santiago")
+
+    def test_antes_de_la_apertura_bloqueado(self):
+        now = datetime(2026, 6, 14, 19, 59, 0, tzinfo=TZ_CL)
+        service, client = self._service(now)
+        self.assertFalse(service.reservations_open())
+        self.assertGreater(service.seconds_until_release(), 0)
+        with self.assertRaises(ReservationsLockedError):
+            service.reserve("b1", "Camila", "Diego")
+        self.assertEqual(client.update_count, 0, "No debe escribir antes de la apertura")
+
+    def test_despues_de_la_apertura_funciona(self):
+        now = datetime(2026, 6, 14, 20, 0, 1, tzinfo=TZ_CL)
+        service, _ = self._service(now)
+        self.assertTrue(service.reservations_open())
+        block = service.reserve("b1", "Camila", "Diego")
+        self.assertEqual(block.estado, ESTADO_RESERVADO)
+
+    def test_sin_fila_config_siempre_abierto(self):
+        now = datetime(2026, 6, 1, 0, 0, 0, tzinfo=TZ_CL)
+        service, _ = self._service(now, with_config=False)
+        self.assertIsNone(service.get_release_time())
+        self.assertTrue(service.reservations_open())
+        block = service.reserve("b1", "Camila", "Diego")
+        self.assertEqual(block.estado, ESTADO_RESERVADO)
+
+    def test_fila_config_no_es_reservable_ni_visible(self):
+        now = datetime(2026, 6, 15, 0, 0, 0, tzinfo=TZ_CL)
+        service, client = self._service(now)
+        visibles = service.visible_blocks()
+        self.assertTrue(all(not b.es_config for b in visibles))
+        self.assertEqual(len(visibles), 1)
+        with self.assertRaises(BlockUnavailableError):
+            service.reserve("config", "Camila", "Diego")
+        self.assertEqual(client.update_count, 0)
+
+    def test_carrera_en_el_segundo_exacto_de_apertura(self):
+        """Justo a las 20:00:00, 30 escuadrones → igual solo 1 gana."""
+        now = datetime(2026, 6, 14, 20, 0, 0, tzinfo=TZ_CL)
+        service, client = self._service(now)
+
+        def intentar(i):
+            try:
+                return service.reserve("b1", f"A{i}", f"B{i}")
+            except Exception as e:
+                return e
+
+        with ThreadPoolExecutor(max_workers=30) as ex:
+            results = list(ex.map(intentar, range(30)))
+
+        exitos = [r for r in results if not isinstance(r, Exception)]
+        self.assertEqual(len(exitos), 1)
+        self.assertEqual(client.update_count, 1)
 
 
 if __name__ == "__main__":

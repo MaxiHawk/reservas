@@ -31,6 +31,28 @@ modalidad (pausas, apertura, cierre) nunca son reservables.
 | 🔴 Reservado | Sellado por un escuadrón | No |
 | ⚫ Bloqueado | Pausa / apertura / cierre o bloqueado por el docente | No |
 
+## ⏳ Liberación programada (estilo venta de entradas)
+
+La apertura de reservas se controla 100% desde Notion con la fila de control
+**“⚙️ Liberación de reservas — editar solo la fecha”**:
+
+- Su propiedad **Horario** define la fecha/hora de apertura (se interpreta
+  LITERALMENTE como hora de Chile, tal como se ve en Notion).
+- **Antes de esa hora**: la app muestra el cronograma bloqueado (🔒) y una
+  **cuenta regresiva en vivo** (días : horas : min : seg). El bloqueo también
+  es real en el servidor: nadie puede reservar aunque manipule la interfaz.
+- **Al llegar a cero**: la app se desbloquea automáticamente y aparecen los
+  botones “Reservar”. Sin intervención del docente.
+- **Para cambiar la fecha**: edita solo el Horario de esa fila (se refleja en
+  ≤ 5 s). Si borras la fila, las reservas quedan abiertas siempre.
+- No cambies el título: la app la reconoce porque comienza con ⚙️. Esta fila
+  nunca se muestra como bloque ni puede reservarse.
+- Zona horaria configurable vía secret opcional `RESERVAS_TZ`
+  (default: `America/Santiago`).
+
+> 💡 Consejo: como Streamlit Cloud “duerme” las apps sin tráfico, abre la URL
+> unos 10 minutos antes de la liberación para que esté despierta en el peak.
+
 ## Garantías técnicas
 
 - **Anti doble-reserva**: instancia única (`@st.cache_resource`) +
@@ -39,6 +61,8 @@ modalidad (pausas, apertura, cierre) nunca son reservables.
   generan muy pocas llamadas reales a la API de Notion (~3 req/s de límite).
 - **Confirmación en 2 pasos**: nombres → declaración explícita → “Sellar la
   reserva”.
+- **Liberación programada**: bloqueo real en servidor antes de la fecha,
+  apertura automática al llegar a cero.
 
 ## Configuración (una sola vez)
 
@@ -65,7 +89,8 @@ python3 tests/test_core.py
 
 Incluye: 30 hilos sellando el mismo bloque → exactamente 1 gana, 29 conflictos,
 1 sola escritura; defensa individual con 1 nombre; pareja exige 2 nombres;
-pausas no reservables; caché e invalidación.
+pausas no reservables; caché e invalidación; liberación programada (bloqueo
+antes de la fecha, apertura después, carrera en el segundo exacto de apertura).
 
 ## Despliegue — Streamlit Community Cloud (gratis)
 
@@ -79,11 +104,12 @@ pausas no reservables; caché e invalidación.
    ```
 4. Comparte la URL con el curso.
 
-> ⚠️ Streamlit Cloud “duerme” apps sin visitas: ábrela unos minutos antes de
-> anunciar la hora de reservas para que despierte antes del peak.
+> ⚠️ Tras actualizar archivos en GitHub, si ves errores raros usa
+> **Manage app → Reboot app** (limpia la caché de recursos).
 
 ## Flujo del Sumo Cartógrafo (docente, desde Notion)
 
+- **Cambiar la fecha de liberación**: editar el `Horario` de la fila ⚙️.
 - **Liberar una reserva**: `Estado → Disponible` y borrar nombres.
 - **Bloquear un bloque**: `Estado → Bloqueado`.
 - **Cambiar horarios o agregar bloques**: editar `Horario` / nueva fila con
@@ -93,12 +119,12 @@ pausas no reservables; caché e invalidación.
 
 ```
 reserva-bloques-streamlit/
-├── app.py                    # UI gamificada (timeline + diálogo 2 pasos)
-├── notion_store.py           # Cliente Notion + reservas thread-safe + modalidades
+├── app.py                    # UI gamificada (countdown + timeline + diálogo 2 pasos)
+├── notion_store.py           # Cliente Notion + reservas thread-safe + liberación
 ├── requirements.txt
 ├── .streamlit/
 │   ├── config.toml           # Tema oscuro AngioMasters
 │   └── secrets.toml.example
 └── tests/
-    └── test_core.py
+    └── test_core.py          # 18 tests (concurrencia, modalidades, liberación)
 ```

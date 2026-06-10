@@ -5,9 +5,18 @@ Streamlit atiende cada sesión en un hilo dentro de UN solo proceso, por lo que
 un threading.Lock global (compartido vía @st.cache_resource en app.py) basta
 para serializar las escrituras y garantizar que un bloque no se reserve dos veces.
 
-Soporta dos modalidades de bloque (propiedad "Modalidad" en Notion):
+Modalidades (propiedad "Modalidad" en Notion):
   - Pareja: requiere 2 nombres.
-  - Individual: requiere 1 nombre (defensa individual, curso impar).
+  - Individual: requiere 1 nombre.
+
+Liberación programada (fila de control ⚙️ en la misma base):
+  - Una fila cuyo título comienza con "⚙️" define en su propiedad Horario la
+    fecha/hora de APERTURA de las reservas. El docente la edita desde Notion.
+  - La hora se interpreta LITERALMENTE como hora de Chile (America/Santiago),
+    tal como se ve en Notion, sin conversiones de zona horaria.
+  - Antes de esa hora, reserve() lanza ReservationsLockedError (bloqueo real
+    en el servidor, no solo visual).
+  - Si no existe fila ⚙️, las reservas están abiertas.
 """
 
 from __future__ import annotations
@@ -16,7 +25,8 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
+from zoneinfo import ZoneInfo
 
 NOTION_VERSION = "2022-06-28"
 NOTION_BASE = "https://api.notion.com/v1"
@@ -38,6 +48,12 @@ ESTADO_BLOQUEADO = "Bloqueado"
 MODALIDAD_PAREJA = "Pareja"
 MODALIDAD_INDIVIDUAL = "Individual"
 
+# Título de la fila de control de liberación (debe COMENZAR con este prefijo)
+CONFIG_PREFIX = "⚙️"
+
+# Zona horaria por defecto para interpretar las fechas escritas en Notion
+TZ_DEFAULT = "America/Santiago"
+
 
 class BlockNotFoundError(Exception):
     """El bloque no existe en la base de datos."""
@@ -45,6 +61,17 @@ class BlockNotFoundError(Exception):
 
 class BlockUnavailableError(Exception):
     """El bloque ya no está disponible (reservado o bloqueado)."""
+
+
+class ReservationsLockedError(Exception):
+    """Las reservas aún no se liberan (fecha de apertura en el futuro)."""
+
+    def __init__(self, release_dt: datetime):
+        self.release_dt = release_dt
+        super().__init__(
+            f"Las reservas se abren el {release_dt.strftime('%d/%m/%Y a las %H:%M')} "
+            f"(hora de Chile)."
+        )
 
 
 @dataclass
@@ -60,10 +87,16 @@ class Block:
     notas: str = ""
 
     @property
+    def es_config(self) -> bool:
+        """True si es la fila de control ⚙️ (no se muestra como bloque)."""
+        return self.titulo.strip().startswith(CONFIG_PREFIX)
+
+    @property
     def reservable(self) -> bool:
-        return self.estado == ESTADO_DISPONIBLE and self.modalidad in (
-            MODALIDAD_PAREJA,
-            MODALIDAD_INDIVIDUAL,
+        return (
+            not self.es_config
+            and self.estado == ESTADO_DISPONIBLE
+            and self.modalidad in (MODALIDAD_PAREJA, MODALIDAD_INDIVIDUAL)
         )
 
     @property
@@ -99,6 +132,23 @@ def _parse_block(page: dict) -> Block:
         modalidad=modalidad,
         notas=_plain_text(props.get(PROP_NOTAS, {}).get("rich_text", [])),
     )
+
+
+def parse_local_dt(iso: Optional[str], tz_name: str = TZ_DEFAULT) -> Optional[datetime]:
+    """Interpreta un datetime de Notion de forma LITERAL en la zona tz_name.
+
+    Se ignora cualquier sufijo de zona ('Z' o '+hh:mm'): la hora que el docente
+    ve escrita en Notion es la hora que vale, en hora de Chile. Así el
+    comportamiento es predecible sin importar cómo serialice la API.
+    """
+    if not iso or len(iso) < 16:
+        return None
+    base = iso[:19] if len(iso) >= 19 else iso[:16] + ":00"
+    try:
+        naive = datetime.fromisoformat(base)
+    except ValueError:
+        return None
+    return naive.replace(tzinfo=ZoneInfo(tz_name))
 
 
 class NotionClient:
@@ -146,19 +196,34 @@ class NotionClient:
 
 
 class ReservationService:
-    """Lógica de reservas con caché de lecturas y lock global de escrituras."""
+    """Lógica de reservas: caché de lecturas, lock global de escrituras y
+    liberación programada controlada desde Notion."""
 
-    def __init__(self, client, cache_ttl: float = 5.0):
+    def __init__(
+        self,
+        client,
+        cache_ttl: float = 5.0,
+        tz_name: str = TZ_DEFAULT,
+        now_fn: Optional[Callable[[], datetime]] = None,
+    ):
         self.client = client
         self.cache_ttl = cache_ttl
+        self.tz_name = tz_name
+        self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self._write_lock = threading.Lock()
         self._cache_lock = threading.Lock()
         self._cache: Optional[list[Block]] = None
         self._cache_time: float = 0.0
 
+    # ---------- Tiempo ----------
+
+    def now(self) -> datetime:
+        return self._now_fn()
+
     # ---------- Lecturas ----------
 
     def list_blocks(self, force_refresh: bool = False) -> list[Block]:
+        """Todas las filas (incluida la de control ⚙️), ordenadas por Horario."""
         with self._cache_lock:
             fresh = (
                 self._cache is not None
@@ -173,15 +238,40 @@ class ReservationService:
             self._cache_time = time.monotonic()
             return blocks
 
+    def visible_blocks(self) -> list[Block]:
+        """Bloques que se muestran en la app (sin la fila de control)."""
+        return [b for b in self.list_blocks() if not b.es_config]
+
     def _invalidate_cache(self) -> None:
         with self._cache_lock:
             self._cache = None
             self._cache_time = 0.0
 
+    # ---------- Liberación programada ----------
+
+    def get_release_time(self) -> Optional[datetime]:
+        """Fecha/hora de apertura definida en la fila ⚙️, o None si no existe."""
+        for b in self.list_blocks():
+            if b.es_config:
+                return parse_local_dt(b.inicio, self.tz_name)
+        return None
+
+    def reservations_open(self) -> bool:
+        release = self.get_release_time()
+        return release is None or self.now() >= release
+
+    def seconds_until_release(self) -> float:
+        """Segundos que faltan para la apertura (<= 0 si ya abrió)."""
+        release = self.get_release_time()
+        if release is None:
+            return 0.0
+        return (release - self.now()).total_seconds()
+
     # ---------- Escrituras ----------
 
     def reserve(self, block_id: str, estudiante_1: str, estudiante_2: str = "") -> Block:
         """Reserva un bloque. Lanza:
+        - ReservationsLockedError si la apertura aún no llega (control en Notion).
         - ValueError si faltan nombres según la modalidad.
         - BlockNotFoundError si el bloque no existe.
         - BlockUnavailableError si ya no está disponible (carrera perdida).
@@ -190,6 +280,11 @@ class ReservationService:
         e2 = (estudiante_2 or "").strip()
         if not e1:
             raise ValueError("Debes ingresar al menos el primer nombre.")
+
+        # Bloqueo real del lado del servidor (no solo visual)
+        release = self.get_release_time()
+        if release is not None and self.now() < release:
+            raise ReservationsLockedError(release)
 
         with self._write_lock:  # serializa TODAS las escrituras
             try:
@@ -200,14 +295,14 @@ class ReservationService:
             block = _parse_block(page)
 
             # Doble verificación contra Notion justo antes de escribir
+            if block.es_config or not block.modalidad:
+                raise BlockUnavailableError(
+                    f"El bloque '{block.titulo}' no es reservable."
+                )
             if block.estado != ESTADO_DISPONIBLE:
                 raise BlockUnavailableError(
                     f"El bloque '{block.titulo}' ya no está disponible "
                     f"(estado actual: {block.estado})."
-                )
-            if not block.modalidad:
-                raise BlockUnavailableError(
-                    f"El bloque '{block.titulo}' no es reservable."
                 )
             if block.modalidad == MODALIDAD_PAREJA and not e2:
                 raise ValueError("Este bloque es en pareja: ingresa ambos nombres.")

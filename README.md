@@ -2,46 +2,33 @@
 
 Aplicación Streamlit con la estética del **Universo AngioMasters // Archivo de la
 Orden** (uam.maxihawk.com) para que los aspirantes reserven su bloque de la
-**Defensa Final Oral** (martes 16 de junio 2026, 14:00–17:30), usando una base
+**Defensa Final Oral** (martes 16 de junio 2026, 14:00–16:46), usando una base
 de datos de Notion como backend administrado por el Sumo Cartógrafo.
 
-## Cronograma holgado (14:00 → 17:30)
+## Diseño
 
-25 estudiantes = 12 parejas + 1 individual → **13 bloques genéricos de 12 min**
-(≈6 de defensa + 2 de preguntas + 4 de holgura/transición):
+- **Tema oscuro sci-fi**: fondo azul profundo, acentos cián neón (#00E5FF) y
+  dorado (#FFD166), tipografías Rajdhani + Share Tech Mono, etiquetas tipo
+  terminal (`// ARCHIVO DE LA ORDEN //`).
+- **Optimizado para 1 día y móviles**: línea de tiempo vertical (no grilla),
+  tarjetas a ancho completo con hora prominente, botones grandes táctiles,
+  pausas/apertura/cierre como filas compactas no reservables.
+- **Narrativa gamificada**: bloques “sellados”, escuadrones, aspirantes,
+  modalidad ★ individual destacada en dorado.
+- **Auto-sincronización** cada 5 s (`st.fragment`), métricas de bloques libres
+  vs. sellados y barra de progreso de la jornada.
 
-| Hora | Bloque |
-|---|---|
-| 14:00–14:10 | 🎬 Apertura e instrucciones |
-| 14:10–14:58 | B1 · B2 · B3 · B4 |
-| 14:58–15:08 | ⏸️ Pausa docente 1 |
-| 15:08–15:56 | B5 · B6 · B7 · B8 |
-| 15:56–16:06 | ⏸️ Pausa docente 2 |
-| 16:06–16:54 | B9 · B10 · B11 · B12 |
-| 16:54–17:04 | ⏸️ Pausa docente 3 |
-| 17:04–17:16 | B13 |
-| 17:16–17:30 | 🏁 Cierre + **14 min de buffer** de contingencia |
+## Bloques (desde Notion)
 
-## Modalidad elegida al inscribirse
-
-Ya **no hay bloque exclusivo individual**: todos los bloques dan la misma
-oportunidad. En el formulario de reserva hay un interruptor
-**“⭐ Me presento de forma INDIVIDUAL (sin pareja)”**:
-
-- Apagado (default): pareja → exige **2 nombres** → Notion registra
-  `Modalidad = Pareja`.
-- Encendido: individual → exige **1 nombre** → Notion registra
-  `Modalidad = Individual` y el bloque se muestra con insignia ⭐.
-
-La columna **Modalidad** de Notion queda vacía en bloques disponibles y la
-llena la app al reservar.
-
-## Estados (desde Notion)
+La base ya contiene el cronograma oficial: Apertura, **B1–B12** (parejas),
+**B13** (individual), 3 pausas docentes y cierre. La propiedad **Modalidad**
+distingue `Pareja` (pide 2 nombres) de `Individual` (pide 1). Las filas sin
+modalidad (pausas, apertura, cierre) nunca son reservables.
 
 | Estado | Significado | ¿Reservable? |
 |---|---|---|
 | 🟢 Disponible | Libre | Sí |
-| 🔴 Reservado | Sellado por un escuadrón o aspirante | No |
+| 🔴 Reservado | Sellado por un escuadrón | No |
 | ⚫ Bloqueado | Pausa / apertura / cierre o bloqueado por el docente | No |
 
 ## ⏳ Liberación programada (estilo venta de entradas)
@@ -81,8 +68,8 @@ La apertura de reservas se controla 100% desde Notion con la fila de control
 
 1. Crea una integración en **notion.so/profile/integrations** (Read + Update
    content) y copia el token.
-2. Abre la base **“Reserva de Bloques - Tribunal Endovascular 2026”** → menú
-   `•••` → **Connections** → agrega tu integración.
+2. Abre la base **“Reserva de Bloques — TMED732 UNAB”** → menú `•••` →
+   **Connections** → agrega tu integración.
 3. Copia el ID de la base (32 caracteres hex de la URL, antes de `?v=`).
 
 ## Desarrollo local
@@ -101,10 +88,9 @@ python3 tests/test_core.py
 ```
 
 Incluye: 30 hilos sellando el mismo bloque → exactamente 1 gana, 29 conflictos,
-1 sola escritura; modalidad individual con 1 nombre en cualquier bloque; pareja
-exige 2 nombres; pausas no reservables; caché e invalidación; liberación
-programada (bloqueo antes de la fecha, apertura después, carrera en el segundo
-exacto de apertura).
+1 sola escritura; defensa individual con 1 nombre; pareja exige 2 nombres;
+pausas no reservables; caché e invalidación; liberación programada (bloqueo
+antes de la fecha, apertura después, carrera en el segundo exacto de apertura).
 
 ## Despliegue — Streamlit Community Cloud (gratis)
 
@@ -124,10 +110,10 @@ exacto de apertura).
 ## Flujo del Sumo Cartógrafo (docente, desde Notion)
 
 - **Cambiar la fecha de liberación**: editar el `Horario` de la fila ⚙️.
-- **Liberar una reserva**: `Estado → Disponible`, borrar nombres y `Modalidad`.
+- **Liberar una reserva**: `Estado → Disponible` y borrar nombres.
 - **Bloquear un bloque**: `Estado → Bloqueado`.
 - **Cambiar horarios o agregar bloques**: editar `Horario` / nueva fila con
-  `Estado = Disponible` (sin Modalidad: la elige el estudiante).
+  `Modalidad` y `Estado = Disponible`.
 
 ## Estructura
 
